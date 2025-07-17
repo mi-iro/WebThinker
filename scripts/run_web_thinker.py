@@ -810,7 +810,8 @@ async def main_async():
     # Prepare sequences
     active_sequences = []
     for item in filtered_data:
-        question = item['Question']
+        # question = item['Question']
+        question = item['question'] + '\n' + item['options']
         instruction = get_multiqa_search_o1_instruction(args.max_search_limit)
         user_prompt = get_task_instruction_openqa(question)
 

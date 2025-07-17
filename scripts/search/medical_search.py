@@ -14,9 +14,10 @@ class MedicalSearch:
             api_key (str): 您的医疗检索 API 的授权 token。
         """
         self.api_key = api_key
-        self.base_url = "https://cloud.infini-ai.com/AIStudio/inference/api/if-dbjcvomldl2t6avm/process-batch-query/"
+        # self.base_url = "https://cloud.infini-ai.com/AIStudio/inference/api/if-dbjcvomldl2t6avm/process-batch-query/"
+        self.base_url = "http://if-dbjcvomldl2t6avm-service:8888/process-batch-query/"
         self.headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            # "Authorization": f"Bearer {self.api_key}",
             "accept": "application/json",
             "Content-Type": "application/json"
         }
