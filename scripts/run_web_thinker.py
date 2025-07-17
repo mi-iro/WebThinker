@@ -38,6 +38,7 @@ from prompts.prompts import (
     get_task_instruction_openqa, 
 )
 from transformers import AutoTokenizer
+from search.medical_search import MedicalSearch
 
 # tokenizer = AutoTokenizer.from_pretrained("/share/project/llm/QwQ-32B")
 # # tokenizer = AutoTokenizer.from_pretrained("/share/project/llm/DeepSeek-R1-Distill-Qwen-32B")
@@ -103,7 +104,8 @@ def parse_args():
     parser.add_argument('--bing_subscription_key', type=str, default=None, help="Bing Search API subscription key.")
     parser.add_argument('--bing_endpoint', type=str, default="https://api.bing.microsoft.com/v7.0/search", help="Bing Search API endpoint.")
     parser.add_argument('--serper_api_key', type=str, default=None, help="Google Serper API key.")
-    parser.add_argument('--search_engine', type=str, default="bing", choices=["bing", "serper"], help="Search engine to use (bing or serper). Default: bing")
+    parser.add_argument('--medical_api_key', type=str, default=None, help="Medical Search API key.")
+    parser.add_argument('--search_engine', type=str, default="bing", choices=["bing", "serper", "medical"], help="Search engine to use (bing, serper, or medical). Default: bing")
     parser.add_argument('--eval', action='store_true', help="Whether to run evaluation after generation.")
     parser.add_argument('--seed', type=int, default=None, help="Random seed for generation. If not set, will use current timestamp as seed.")
     parser.add_argument('--api_base_url', type=str, required=True, help="Base URL for the API endpoint")
@@ -139,19 +141,19 @@ def extract_between(text, start_marker, end_marker):
         print(f"-------------------")
         return None
 
-def format_search_results(relevant_info: List[Dict]) -> str:
+def format_search_results(relevant_info: List[Dict], search_engine: str) -> str:
     """Format search results into a readable string"""
     formatted_documents = ""
-    for i, doc_info in enumerate(relevant_info):
-        doc_info['title'] = doc_info['title'].replace('<b>','').replace('</b>','')
-        doc_info['snippet'] = doc_info['snippet'].replace('<b>','').replace('</b>','')
-        formatted_documents += f"***Web Page {i + 1}:***\n"
-        formatted_documents += json.dumps(doc_info, ensure_ascii=False, indent=2) + "\n"
-        # formatted_documents += f"Title: {doc_info['title']}\n"
-        # formatted_documents += f"URL: {doc_info['url']}\n"
-        # formatted_documents += f"Snippet: {doc_info['snippet']}\n\n"
-        # if 'page_info' in doc_info:
-        #     formatted_documents += f"Web Page Information: {doc_info['page_info']}\n\n\n\n"
+    if search_engine == "medical":
+        for i, doc_info in enumerate(relevant_info):
+            formatted_documents += f"***Medical Document {i + 1}:***\n"
+            formatted_documents += doc_info.get('snippet', '') + "\n\n"
+    else:
+        for i, doc_info in enumerate(relevant_info):
+            doc_info['title'] = doc_info.get('title', '').replace('<b>','').replace('</b>','')
+            doc_info['snippet'] = doc_info.get('snippet', '').replace('<b>','').replace('</b>','')
+            formatted_documents += f"***Web Page {i + 1}:***\n"
+            formatted_documents += json.dumps(doc_info, ensure_ascii=False, indent=2) + "\n"
     return formatted_documents
 
 
@@ -227,11 +229,14 @@ async def generate_deep_web_explorer(
     search_cache: Dict,
     url_cache: Dict,
     semaphore: asyncio.Semaphore,
-) -> Tuple[str, List[Dict], str]:
+) -> Tuple[str, str]:
     """
     Generate deep web exploration with multiple search and click operations
-    Returns the output, list of interaction records, and initial prompt
+    Returns the output and initial prompt
     """
+    if args.search_engine == "medical":
+        return document, document
+        
     prompt = get_deep_web_explorer_instruction(search_query=search_query, search_intent=search_intent, search_result=document)
     output = ""
     original_prompt = ""
@@ -313,7 +318,7 @@ async def generate_deep_web_explorer(
                 else: # Should not happen
                     relevant_info = []
 
-                formatted_documents = format_search_results(relevant_info)
+                formatted_documents = format_search_results(relevant_info, args.search_engine)
                 
                 # Append search results
                 search_result = f"\n{BEGIN_SEARCH_RESULT}\n{formatted_documents}\n{END_SEARCH_RESULT}\n"
@@ -423,10 +428,11 @@ async def process_single_sequence(
     search_cache: Dict,
     url_cache: Dict,
     batch_output_records: List[Dict],
+    medical_search_engine: Optional[MedicalSearch] = None,
 ) -> Dict:
     """Process a single sequence through its entire reasoning chain with MAX_TOKENS limit"""
     
-    # 初始化 token 计数器，初始值设为 prompt 的 token 数（简单用 split() 作为近似）
+    # Initialize token counter
     MAX_TOKENS = 40000
     total_tokens = len(seq['prompt'].split())
     
@@ -467,7 +473,7 @@ async def process_single_sequence(
         seq['search_count'] += 1
 
         if seq['search_count'] < args.max_search_limit and total_tokens < MAX_TOKENS:
-            if search_query is None or len(search_query) <= 5 or END_SEARCH_QUERY in search_query or search_query in invalid_search_queries: # 不合法的query
+            if search_query is None or len(search_query) <= 5 or END_SEARCH_QUERY in search_query or search_query in invalid_search_queries:
                 continue
 
             if search_query in seq['executed_search_queries']:
@@ -487,7 +493,7 @@ async def process_single_sequence(
                 semaphore=semaphore,
             )
 
-            # 执行搜索和后续操作（同原逻辑）
+            # Execute search
             if search_query in search_cache:
                 results = search_cache[search_query]
             else:
@@ -496,6 +502,8 @@ async def process_single_sequence(
                         results = await bing_web_search_async(search_query, args.bing_subscription_key, args.bing_endpoint)
                     elif args.search_engine == "serper":
                         results = await google_serper_search_async(search_query, args.serper_api_key)
+                    elif args.search_engine == "medical":
+                        results = await asyncio.to_thread(medical_search_engine.search, search_query, topk=args.top_k)
                     else: # Should not happen
                         results = {}
                     search_cache[search_query] = results
@@ -508,79 +516,70 @@ async def process_single_sequence(
                 relevant_info = extract_relevant_info(results)[:args.top_k]
             elif args.search_engine == "serper":
                 relevant_info = extract_relevant_info_serper(results)[:args.top_k]
+            elif args.search_engine == "medical":
+                relevant_info = results
             else: # Should not happen
                 relevant_info = []
 
             # Process documents
-            urls_to_fetch = []
-            for doc_info in relevant_info:
-                url = doc_info['url']
-                if url not in url_cache:
-                    urls_to_fetch.append(url)
+            if args.search_engine != "medical":
+                urls_to_fetch = []
+                for doc_info in relevant_info:
+                    url = doc_info['url']
+                    if url not in url_cache:
+                        urls_to_fetch.append(url)
 
-            if urls_to_fetch:
-                try:
-                    contents = await fetch_page_content_async(
-                        urls_to_fetch, 
-                        use_jina=args.use_jina, 
-                        jina_api_key=args.jina_api_key, 
-                        keep_links=args.keep_links
-                    )
-                    for url, content in contents.items():
-                        # Only cache content if it doesn't contain error indicators
-                        has_error = (any(indicator.lower() in content.lower() for indicator in error_indicators) and len(content.split()) < 64) or len(content) < 50 or len(content.split()) < 20
-                        if not has_error:
-                            url_cache[url] = content
-                        # else:
-                        #     print(f'---Fetching Error\n{content}')
-                except Exception as e:
-                    print(f"Error fetching URLs: {e}")
+                if urls_to_fetch:
+                    try:
+                        contents = await fetch_page_content_async(
+                            urls_to_fetch, 
+                            use_jina=args.use_jina, 
+                            jina_api_key=args.jina_api_key, 
+                            keep_links=args.keep_links
+                        )
+                        for url, content in contents.items():
+                            has_error = (any(indicator.lower() in content.lower() for indicator in error_indicators) and len(content.split()) < 64) or len(content) < 50 or len(content.split()) < 20
+                            if not has_error:
+                                url_cache[url] = content
+                    except Exception as e:
+                        print(f"Error fetching URLs: {e}")
 
-            # Get web page information for each result
-            for doc_info in relevant_info:
-                url = doc_info['url']
-                if url not in url_cache:
-                    raw_content = ""
-                else:
-                    raw_content = url_cache[url]
-                    is_success, raw_content = extract_snippet_with_context(raw_content, doc_info['snippet'], context_chars=2000)
+                # Get web page information for each result
+                for doc_info in relevant_info:
+                    url = doc_info['url']
+                    if url not in url_cache:
+                        raw_content = ""
+                    else:
+                        raw_content = url_cache[url]
+                        is_success, raw_content = extract_snippet_with_context(raw_content, doc_info['snippet'], context_chars=2000)
 
-                # Check if content has error indicators
-                has_error = any(indicator.lower() in raw_content.lower() for indicator in error_indicators) or raw_content == ""
-            
-                if has_error:
-                    # If content has error, use it directly as summary
-                    doc_info['page_info'] = "Can not fetch the page content."
-                else:
-                    # Use raw content directly as page info
-                    doc_info['page_info'] = raw_content
-                    # # Use detailed web page reader to process content
-                    # reader_prompt = get_detailed_web_page_reader_instruction(search_query, search_intent, raw_content)
-                    # _, page_info = await generate_response(
-                    #     client=aux_client,
-                    #     prompt=reader_prompt,
-                    #     semaphore=semaphore,
-                    #     max_tokens=4000,
-                    #     model_name=args.aux_model_name,
-                    # )
-                    # doc_info['page_info'] = page_info
+                    has_error = any(indicator.lower() in raw_content.lower() for indicator in error_indicators) or raw_content == ""
+                
+                    if has_error:
+                        doc_info['page_info'] = "Can not fetch the page content."
+                    else:
+                        doc_info['page_info'] = raw_content
 
-            formatted_documents = format_search_results(relevant_info)
+            formatted_documents = format_search_results(relevant_info, args.search_engine)
 
             # Generate deep web exploration with interactions
-            analysis, explorer_prompt = await generate_deep_web_explorer(
-                client=client,
-                aux_client=aux_client,
-                search_query=search_query,
-                search_intent=search_intent,
-                document=formatted_documents,
-                args=args,
-                search_cache=search_cache,
-                url_cache=url_cache,
-                semaphore=semaphore,
-            )
-
-            extracted_info = extract_answer_fn(analysis, mode='summary')
+            if args.search_engine != "medical":
+                analysis, explorer_prompt = await generate_deep_web_explorer(
+                    client=client,
+                    aux_client=aux_client,
+                    search_query=search_query,
+                    search_intent=search_intent,
+                    document=formatted_documents,
+                    args=args,
+                    search_cache=search_cache,
+                    url_cache=url_cache,
+                    semaphore=semaphore,
+                )
+                extracted_info = extract_answer_fn(analysis, mode='summary')
+            else:
+                analysis = formatted_documents
+                explorer_prompt = ""
+                extracted_info = analysis
 
             # Store web explorer input/output with all interactions
             seq['web_explorer'].append({
@@ -695,12 +694,20 @@ async def main_async():
     elif args.search_engine == "serper" and not args.serper_api_key:
         print("Error: Serper search engine is selected, but --serper_api_key is not provided.")
         return
-    elif args.search_engine not in ["bing", "serper"]: # Should be caught by choices, but good to have
-        print(f"Error: Invalid search engine '{args.search_engine}'. Choose 'bing' or 'serper'.")
+    elif args.search_engine == "medical" and not args.medical_api_key:
+        print("Error: Medical search engine is selected, but --medical_api_key is not provided.")
+        return
+    elif args.search_engine not in ["bing", "serper", "medical"]:
+        print(f"Error: Invalid search engine '{args.search_engine}'. Choose 'bing', 'serper', or 'medical'.")
         return
 
     if args.jina_api_key == 'None':
         jina_api_key = None
+
+    # Initialize medical search engine if selected
+    medical_search_engine = None
+    if args.search_engine == "medical":
+        medical_search_engine = MedicalSearch(api_key=args.medical_api_key)
 
     # Modified data loading section
     if args.single_question:
@@ -847,7 +854,8 @@ async def main_async():
                 args=args,
                 search_cache=search_cache,
                 url_cache=url_cache,
-                batch_output_records=batch_output_records
+                batch_output_records=batch_output_records,
+                medical_search_engine=medical_search_engine,
             )
             for seq in active_sequences
         ]
